@@ -92,18 +92,28 @@ class ForumMonitor:
                 data=payload
             )
 
+            logger.info(f"После логина URL: {r.url}")
+            logger.info(f"Статус: {r.status_code}")
+
+            # Проверяем — редирект на 2FA
+            url_str = str(r.url)
+            if "two-step" in url_str or "two_step" in url_str:
+                logger.info("Требуется 2FA")
+                return "2fa_required"
+
+            # Проверяем содержимое на 2FA
+            if "two_step" in r.text or "totp" in r.text or "two-step" in r.text:
+                logger.info("Требуется 2FA (по тексту страницы)")
+                return "2fa_required"
+
             # Проверяем успешность входа
-            if "logout" in r.text.lower() or "выйти" in r.text.lower():
+            if "logout" in r.text.lower() or "выйти" in r.text.lower() or "log-out" in r.text.lower():
                 self._save_session()
                 self.is_logged_in = True
                 logger.info("Успешный вход на форум")
                 return True
 
-            # Возможно нужен 2FA
-            if "two_step" in r.url.path or "two-step" in r.url.path or "totp" in r.text.lower():
-                return "2fa_required"
-
-            logger.warning("Вход не удался")
+            logger.warning(f"Вход не удался. URL: {r.url}, фрагмент страницы: {r.text[:500]}")
             return False
 
         except Exception as e:
