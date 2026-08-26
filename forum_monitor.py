@@ -1,19 +1,18 @@
 import asyncio
 import logging
 import re
-import pickle
+import json
 import os
-from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 
-import httpx
 from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 from config import config
 
 logger = logging.getLogger(__name__)
 
-SESSION_FILE = "forum_session.pkl"
+SESSION_FILE = "forum_session.json"
 
 ALLOWED_VIDEO_PLATFORMS = [
     "youtube.com", "youtu.be", "twitch.tv", "trovo.live",
@@ -37,134 +36,158 @@ STATS = {
 class ForumMonitor:
     def __init__(self, bot):
         self.bot = bot
-        self.client: Optional[httpx.AsyncClient] = None
+        self.playwright = None
+        self.browser: Optional[Browser] = None
+        self.context: Optional[BrowserContext] = None
         self.is_logged_in = False
-        self._load_session()
 
-    def _load_session(self):
-        """Загрузить сохранённую сессию"""
+    async def _init_browser(self):
+        """Инициализировать браузер"""
+        if self.playwright is None:
+            self.playwright = await async_playwright().start()
+        if self.browser is None or not self.browser.is_connected():
+            self.browser = await self.playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+            )
+
+    async def _get_context(self) -> BrowserContext:
+        """Получить контекст браузера (с сохранённой сессией если есть)"""
+        await self._init_browser()
+        if self.context:
+            return self.context
+
+        storage = {}
         if os.path.exists(SESSION_FILE):
-            with open(SESSION_FILE, "rb") as f:
-                cookies = pickle.load(f)
-            self.client = httpx.AsyncClient(
-                cookies=cookies,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-                follow_redirects=True,
-                timeout=30
-            )
-            self.is_logged_in = True
-            logger.info("Сессия загружена из файла")
-        else:
-            self.client = httpx.AsyncClient(
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-                follow_redirects=True,
-                timeout=30
-            )
-            self.is_logged_in = False
+            with open(SESSION_FILE, "r") as f:
+                storage = json.load(f)
 
-    def _save_session(self):
-        with open(SESSION_FILE, "wb") as f:
-            pickle.dump(dict(self.client.cookies), f)
-        logger.info("Сессия сохранена")
+        self.context = await self.browser.new_context(
+            storage_state=storage if storage else None,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        return self.context
 
-    async def login(self, username: str, password: str, totp_code: str = "") -> bool:
-        """Вход на форум"""
+    async def _save_session(self):
+        """Сохранить сессию"""
+        if self.context:
+            storage = await self.context.storage_state()
+            with open(SESSION_FILE, "w") as f:
+                json.dump(storage, f)
+            logger.info("Сессия сохранена")
+
+    async def login(self, username: str, password: str) -> str:
+        """Вход на форум через браузер"""
         try:
-            # Получить страницу логина для csrf токена
-            r = await self.client.get("https://forum.majestic-rp.ru/login/")
-            soup = BeautifulSoup(r.text, "html.parser")
+            ctx = await self._get_context()
+            page = await ctx.new_page()
 
-            csrf_input = soup.find("input", {"name": "_xfToken"})
-            csrf_token = csrf_input["value"] if csrf_input else ""
+            logger.info("Открываю страницу логина...")
+            await page.goto("https://forum.majestic-rp.ru/login/", wait_until="networkidle", timeout=30000)
 
-            payload = {
-                "_xfToken": csrf_token,
-                "login": username,
-                "password": password,
-                "remember": "1",
-                "_xfRedirect": "https://forum.majestic-rp.ru/",
-            }
-            if totp_code:
-                payload["totp_code"] = totp_code
+            # Ждём пока JS защита пройдёт
+            await page.wait_for_selector("input[name='login']", timeout=15000)
 
-            r = await self.client.post(
-                "https://forum.majestic-rp.ru/login/login",
-                data=payload
-            )
+            await page.fill("input[name='login']", username)
+            await page.fill("input[name='password']", password)
 
-            logger.info(f"После логина URL: {r.url}")
-            logger.info(f"Статус: {r.status_code}")
+            # Чекбокс "запомнить"
+            try:
+                await page.check("input[name='remember']")
+            except:
+                pass
 
-            # Проверяем — редирект на 2FA
-            url_str = str(r.url)
-            if "two-step" in url_str or "two_step" in url_str:
-                logger.info("Требуется 2FA")
+            await page.click("button[type='submit']")
+            await page.wait_for_load_state("networkidle", timeout=15000)
+
+            url = page.url
+            logger.info(f"После логина URL: {url}")
+
+            # Проверяем 2FA
+            if "two-step" in url or "two_step" in url:
+                await page.close()
                 return "2fa_required"
 
-            # Проверяем содержимое на 2FA
-            if "two_step" in r.text or "totp" in r.text or "two-step" in r.text:
-                logger.info("Требуется 2FA (по тексту страницы)")
-                return "2fa_required"
-
-            # Проверяем успешность входа
-            if "logout" in r.text.lower() or "выйти" in r.text.lower() or "log-out" in r.text.lower():
-                self._save_session()
+            # Проверяем успех
+            content = await page.content()
+            if "logout" in content.lower() or "выйти" in content.lower():
+                await self._save_session()
                 self.is_logged_in = True
-                logger.info("Успешный вход на форум")
-                return True
+                await page.close()
+                logger.info("Успешный вход!")
+                return "success"
 
-            logger.warning(f"Вход не удался. URL: {r.url}, фрагмент страницы: {r.text[:500]}")
-            return False
+            # Может быть 2FA по содержимому
+            if "two_step" in content or "totp" in content:
+                await page.close()
+                return "2fa_required"
+
+            await page.close()
+            logger.warning("Вход не удался")
+            return "failed"
 
         except Exception as e:
             logger.error(f"Ошибка входа: {e}")
-            return False
+            return "failed"
 
     async def submit_2fa(self, totp_code: str) -> bool:
         """Отправить 2FA код"""
         try:
-            r = await self.client.get("https://forum.majestic-rp.ru/login/two-step")
-            soup = BeautifulSoup(r.text, "html.parser")
-            csrf_input = soup.find("input", {"name": "_xfToken"})
-            csrf_token = csrf_input["value"] if csrf_input else ""
+            ctx = await self._get_context()
+            page = await ctx.new_page()
 
-            payload = {
-                "_xfToken": csrf_token,
-                "code": totp_code,
-                "provider": "totp",
-                "remember": "1",
-                "trust": "1",
-                "_xfRedirect": "https://forum.majestic-rp.ru/",
-            }
-            r = await self.client.post(
-                "https://forum.majestic-rp.ru/login/two-step",
-                data=payload
-            )
-            if "logout" in r.text.lower() or "выйти" in r.text.lower():
-                self._save_session()
+            await page.goto("https://forum.majestic-rp.ru/login/two-step", wait_until="networkidle", timeout=20000)
+
+            # Вводим код
+            await page.fill("input[name='code']", totp_code)
+
+            # Чекбокс доверять устройству
+            try:
+                await page.check("input[name='trust']")
+            except:
+                pass
+
+            await page.click("button[type='submit']")
+            await page.wait_for_load_state("networkidle", timeout=15000)
+
+            content = await page.content()
+            if "logout" in content.lower() or "выйти" in content.lower():
+                await self._save_session()
                 self.is_logged_in = True
+                await page.close()
                 return True
+
+            await page.close()
             return False
+
         except Exception as e:
             logger.error(f"Ошибка 2FA: {e}")
             return False
 
     async def check_session(self) -> bool:
-        """Проверить что сессия ещё живая"""
+        """Проверить что сессия жива"""
         try:
-            r = await self.client.get("https://forum.majestic-rp.ru/")
-            return "logout" in r.text.lower() or "выйти" in r.text.lower()
+            ctx = await self._get_context()
+            page = await ctx.new_page()
+            await page.goto("https://forum.majestic-rp.ru/", wait_until="networkidle", timeout=20000)
+            content = await page.content()
+            await page.close()
+            return "logout" in content.lower() or "выйти" in content.lower()
         except:
             return False
 
     async def get_new_threads(self) -> List[Dict]:
-        """Получить список новых тем в разделе"""
+        """Получить список новых тем"""
         try:
-            r = await self.client.get(config.FORUM_URL)
-            soup = BeautifulSoup(r.text, "html.parser")
+            ctx = await self._get_context()
+            page = await ctx.new_page()
+            await page.goto(config.FORUM_URL, wait_until="networkidle", timeout=20000)
+            content = await page.content()
+            await page.close()
 
+            soup = BeautifulSoup(content, "html.parser")
             threads = []
-            # XenForo структура тем
+
             for item in soup.select("div.structItem--thread"):
                 title_el = item.select_one("div.structItem-title a[data-tp-primary]")
                 if not title_el:
@@ -172,7 +195,8 @@ class ForumMonitor:
                 if not title_el:
                     continue
 
-                thread_url = "https://forum.majestic-rp.ru" + title_el["href"]
+                href = title_el.get("href", "")
+                thread_url = "https://forum.majestic-rp.ru" + href
                 thread_id = re.search(r'\.(\d+)/?$', thread_url)
                 if not thread_id:
                     continue
@@ -181,17 +205,10 @@ class ForumMonitor:
                 if thread_id in config.processed_threads:
                     continue
 
-                # Проверяем счётчик ответов
-                replies_el = item.select_one("dl.pairs--justified dt")
-                # Дата
-                date_el = item.select_one("time")
-                date_str = date_el["datetime"] if date_el else ""
-
                 threads.append({
                     "id": thread_id,
                     "title": title_el.text.strip(),
                     "url": thread_url,
-                    "date": date_str,
                 })
 
             return threads
@@ -200,51 +217,103 @@ class ForumMonitor:
             return []
 
     async def get_thread_content(self, url: str) -> Optional[Dict]:
-        """Получить содержимое темы и список ответов"""
+        """Получить содержимое темы"""
         try:
-            r = await self.client.get(url)
-            soup = BeautifulSoup(r.text, "html.parser")
+            ctx = await self._get_context()
+            page = await ctx.new_page()
+            await page.goto(url, wait_until="networkidle", timeout=20000)
+            content = await page.content()
+            await page.close()
 
-            # Первый пост
+            soup = BeautifulSoup(content, "html.parser")
+
             first_post = soup.select_one("article.message--post")
             if not first_post:
                 return None
 
-            content = first_post.select_one("div.bbWrapper")
-            content_text = content.get_text("\n", strip=True) if content else ""
+            body = first_post.select_one("div.bbWrapper")
+            content_text = body.get_text("\n", strip=True) if body else ""
 
-            # Все ответы
             all_posts = soup.select("article.message--post")
             replies = []
-            for post in all_posts[1:]:  # пропускаем первый (сам вопрос)
+            for post in all_posts[1:]:
                 author_el = post.select_one("a.username")
-                author = author_el.text.strip() if author_el else "Unknown"
-                replies.append(author)
+                if author_el:
+                    replies.append(author_el.text.strip())
 
-            # CSRF токен для ответа
-            csrf_input = soup.find("input", {"name": "_xfToken"})
-            csrf_token = csrf_input["value"] if csrf_input else ""
-
-            # ID темы для XenForo
-            thread_id_match = re.search(r'thread-(\d+)', r.text)
-            xf_thread_id = thread_id_match.group(1) if thread_id_match else None
+            # XenForo thread ID
+            xf_id_match = re.search(r'/threads/[^/]+-(\d+)/', url)
+            if not xf_id_match:
+                xf_id_match = re.search(r'\.(\d+)/?', url)
+            xf_thread_id = xf_id_match.group(1) if xf_id_match else None
 
             return {
                 "content": content_text,
                 "replies": replies,
-                "csrf_token": csrf_token,
                 "xf_thread_id": xf_thread_id,
-                "html": r.text
             }
         except Exception as e:
             logger.error(f"Ошибка чтения темы: {e}")
             return None
 
+    async def post_reply(self, url: str, message: str, xf_thread_id: str) -> bool:
+        """Ответить в теме"""
+        try:
+            ctx = await self._get_context()
+            page = await ctx.new_page()
+            await page.goto(url, wait_until="networkidle", timeout=20000)
+
+            # Заполнить текстовое поле ответа
+            await page.wait_for_selector(".js-editorHiddenVal, textarea[name='message']", timeout=10000)
+
+            try:
+                # XenForo rich editor
+                editor = page.locator(".fr-element[contenteditable='true']")
+                await editor.click()
+                await editor.fill(message)
+            except:
+                # Fallback: обычный textarea
+                await page.fill("textarea[name='message']", message)
+
+            await page.click("button.button--primary[type='submit']")
+            await page.wait_for_load_state("networkidle", timeout=15000)
+            await page.close()
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка ответа: {e}")
+            return False
+
+    async def close_thread(self, url: str, xf_thread_id: str) -> bool:
+        """Закрыть тему"""
+        try:
+            ctx = await self._get_context()
+            page = await ctx.new_page()
+
+            # Открыть меню управления темой
+            await page.goto(url, wait_until="networkidle", timeout=20000)
+
+            # XenForo: кнопка закрытия темы для модераторов
+            try:
+                await page.click("a[data-xf-click='overlay'][href*='toggle-open']", timeout=5000)
+                await page.wait_for_load_state("networkidle", timeout=10000)
+            except:
+                # Альтернатив: через inline mod
+                try:
+                    close_url = f"https://forum.majestic-rp.ru/threads/{xf_thread_id}/toggle-open"
+                    await page.goto(close_url, wait_until="networkidle", timeout=15000)
+                except:
+                    pass
+
+            await page.close()
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка закрытия темы: {e}")
+            return False
+
     def validate_thread(self, content: str, title: str) -> Dict:
         """Проверить жалобу по правилам"""
         errors = []
 
-        # 1. Проверка обязательных полей
         required_fields = [
             "Ваш игровой никнейм",
             "Ваш статический ID",
@@ -254,73 +323,33 @@ class ForumMonitor:
             "Доказательства",
         ]
         for field in required_fields:
-            # Ищем поле и проверяем что после него есть текст
-            pattern = re.compile(re.escape(field) + r'[\s\S]{0,20}?[\n\r]([\s\S]+?)(?=Ваш|Статический|Дата|Краткое|Доказательства|$)', re.IGNORECASE)
-            match = pattern.search(content)
-            if not match or not match.group(1).strip() or match.group(1).strip() == "ㅤ":
+            idx = content.find(field)
+            if idx == -1:
+                errors.append(f"❌ Поле «{field}» отсутствует (Правило 1)")
+                continue
+            after = content[idx + len(field):idx + len(field) + 200].strip()
+            if not after or after.startswith("ㅤ") or len(after) < 2:
                 errors.append(f"❌ Поле «{field}» не заполнено (Правило 1)")
 
-        # 2. Проверка доказательств на разрешённые платформы
         urls_in_content = re.findall(r'https?://[^\s\]>\"\']+', content)
-        has_valid_proof = False
-        has_any_url = bool(urls_in_content)
+        has_valid_proof = any(
+            any(p in url for p in ALLOWED_VIDEO_PLATFORMS + ALLOWED_IMAGE_PLATFORMS)
+            for url in urls_in_content
+        )
 
-        for url in urls_in_content:
-            if any(p in url for p in ALLOWED_VIDEO_PLATFORMS + ALLOWED_IMAGE_PLATFORMS):
-                has_valid_proof = True
-                break
-
-        if has_any_url and not has_valid_proof:
+        if urls_in_content and not has_valid_proof:
             errors.append("❌ Доказательства загружены не на разрешённую платформу (Правило 10/10.1)")
-
-        if not has_any_url:
+        if not urls_in_content:
             errors.append("❌ Доказательства не предоставлены (Правило 4)")
 
-        # 3. Проверка на видео для серьёзных нарушений
-        serious_keywords = ["deathmatch", "dm", "db", "pg", "nonrp", "non-rp", "оскорбление"]
+        serious_keywords = ["deathmatch", " dm ", " db ", "pg", "nonrp", "non-rp", "оскорбление"]
         is_serious = any(kw in content.lower() or kw in title.lower() for kw in serious_keywords)
         if is_serious:
             has_video = any(p in content for p in ["youtube.com", "youtu.be", "twitch.tv", "rutube.ru", "trovo.live", "vkvideo.ru"])
             if not has_video:
-                errors.append("❌ Для данного типа нарушения требуется видеозапись (Правило 4)")
+                errors.append("❌ Для данного нарушения требуется видеозапись (Правило 4)")
 
-        return {
-            "valid": len(errors) == 0,
-            "errors": errors
-        }
-
-    async def post_reply(self, thread_url: str, message: str, csrf_token: str, xf_thread_id: str) -> bool:
-        """Оставить ответ в теме"""
-        try:
-            payload = {
-                "_xfToken": csrf_token,
-                "message": message,
-                "_xfWithData": "1",
-                "last_date": "0",
-                "last_known_date": "0",
-            }
-            post_url = f"https://forum.majestic-rp.ru/threads/{xf_thread_id}/add-reply"
-            r = await self.client.post(post_url, data=payload)
-            return r.status_code == 200 and ("error" not in r.text.lower() or "message" in r.text.lower())
-        except Exception as e:
-            logger.error(f"Ошибка ответа: {e}")
-            return False
-
-    async def close_thread(self, thread_url: str, csrf_token: str, xf_thread_id: str) -> bool:
-        """Закрыть тему"""
-        try:
-            payload = {
-                "_xfToken": csrf_token,
-                "discussion_open": "0",
-            }
-            r = await self.client.post(
-                f"https://forum.majestic-rp.ru/threads/{xf_thread_id}/edit",
-                data=payload
-            )
-            return r.status_code in [200, 303]
-        except Exception as e:
-            logger.error(f"Ошибка закрытия темы: {e}")
-            return False
+        return {"valid": len(errors) == 0, "errors": errors}
 
     async def process_thread(self, thread: Dict) -> str:
         """Обработать одну тему"""
@@ -329,112 +358,83 @@ class ForumMonitor:
         title = thread["title"]
 
         STATS["total_checked"] += 1
-
-        data = await get_thread_content_safe(self, url)
+        data = await self.get_thread_content(url)
         if not data:
             return "error"
 
-        # Проверить — взята ли тема другим администратором
         if data["replies"]:
             taken_by = data["replies"][0]
             STATS["skipped_taken"] += 1
-            await self.notify(
-                f"⚠️ Тема уже взята\n"
-                f"📌 [{title}]({url})\n"
-                f"👤 Взял: {taken_by}"
-            )
+            await self.notify(f"⚠️ Тема уже взята\n📌 [{title}]({url})\n👤 Взял: {taken_by}")
             config.processed_threads.append(thread_id)
             config.save()
             return "taken"
 
-        # Валидация жалобы
         validation = self.validate_thread(data["content"], title)
 
         if not config.reply_template:
-            logger.warning("Шаблон ответа не настроен, пропускаем")
+            logger.warning("Шаблон ответа не настроен")
             return "no_template"
 
         if validation["valid"]:
             reply_text = config.reply_template
             STATS["accepted"] += 1
-            status_emoji = "✅"
-            status_text = "Принята"
+            status_emoji, status_text = "✅", "Принята"
         else:
             errors_text = "\n".join(validation["errors"])
-            reply_text = (
-                f"Жалоба отклонена по следующим причинам:\n\n"
-                f"{errors_text}\n\n"
-                f"Пожалуйста, исправьте ошибки и подайте жалобу заново."
-            )
+            reply_text = f"Жалоба отклонена по следующим причинам:\n\n{errors_text}\n\nПожалуйста, исправьте ошибки и подайте жалобу заново."
             STATS["rejected"] += 1
             for err in validation["errors"]:
                 key = err[:50]
                 STATS["reject_reasons"][key] = STATS["reject_reasons"].get(key, 0) + 1
-            status_emoji = "❌"
-            status_text = "Отклонена"
+            status_emoji, status_text = "❌", "Отклонена"
 
-        # Ответить
-        replied = await self.post_reply(url, reply_text, data["csrf_token"], data["xf_thread_id"])
-
-        # Закрыть тему
+        replied = await self.post_reply(url, reply_text, data["xf_thread_id"])
         if replied:
-            await self.close_thread(url, data["csrf_token"], data["xf_thread_id"])
+            await self.close_thread(url, data["xf_thread_id"])
 
-        # Уведомление
         errors_preview = "\n".join(validation["errors"][:3]) if not validation["valid"] else ""
-        await self.notify(
-            f"{status_emoji} Жалоба {status_text}\n"
-            f"📌 [{title}]({url})\n"
-            f"{errors_preview}"
-        )
+        await self.notify(f"{status_emoji} Жалоба {status_text}\n📌 [{title}]({url})\n{errors_preview}")
 
         config.processed_threads.append(thread_id)
         config.save()
         return "processed"
 
-    async def notify(self, text: str, channel: bool = True):
-        """Отправить уведомление в канал и/или боту"""
+    async def notify(self, text: str):
         try:
-            from config import config as cfg
-            if channel and cfg.CHANNEL_ID:
-                await self.bot.send_message(cfg.CHANNEL_ID, text, parse_mode="Markdown")
+            if config.CHANNEL_ID:
+                await self.bot.send_message(config.CHANNEL_ID, text, parse_mode="Markdown")
         except Exception as e:
             logger.error(f"Ошибка уведомления: {e}")
 
     async def start_monitoring(self):
         """Основной цикл мониторинга"""
         logger.info("Мониторинг запущен")
+        check_count = 0
         while True:
             if config.is_monitoring and self.is_logged_in:
                 try:
-                    # Проверяем сессию раз в час
-                    session_ok = await self.check_session()
-                    if not session_ok:
-                        self.is_logged_in = False
-                        await self.bot.send_message(
-                            config.ADMIN_ID,
-                            "⚠️ Сессия форума истекла! Нужна повторная авторизация.\n"
-                            "Нажми /login"
-                        )
-                        await asyncio.sleep(60)
-                        continue
+                    # Проверяем сессию каждые 30 итераций
+                    if check_count % 30 == 0:
+                        session_ok = await self.check_session()
+                        if not session_ok:
+                            self.is_logged_in = False
+                            await self.bot.send_message(
+                                config.ADMIN_ID,
+                                "⚠️ Сессия форума истекла! Нужна повторная авторизация.\nНажми /start"
+                            )
+                            await asyncio.sleep(60)
+                            continue
 
                     threads = await self.get_new_threads()
-                    logger.info(f"Найдено новых тем: {len(threads)}")
-
+                    if threads:
+                        logger.info(f"Найдено новых тем: {len(threads)}")
                     for thread in threads:
                         await self.process_thread(thread)
-                        await asyncio.sleep(3)  # пауза между обработкой тем
+                        await asyncio.sleep(5)
 
+                    check_count += 1
                 except Exception as e:
                     logger.error(f"Ошибка мониторинга: {e}")
 
             await asyncio.sleep(config.check_interval)
-
-
-async def get_thread_content_safe(monitor: ForumMonitor, url: str):
-    try:
-        return await monitor.get_thread_content(url)
-    except Exception as e:
-        logger.error(f"Ошибка: {e}")
-        return None

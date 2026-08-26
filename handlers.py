@@ -170,7 +170,7 @@ def register_handlers(dp: Dispatcher, monitor: ForumMonitor):
                 "📱 Требуется код из Google Authenticator.\n"
                 "Введи 6-значный код:"
             )
-        elif result is True:
+        elif result == "success":
             await state.clear()
             await msg.edit_text("✅ Авторизация успешна! Мониторинг можно запускать.")
         else:
