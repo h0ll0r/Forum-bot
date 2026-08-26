@@ -1,0 +1,8 @@
+[variables]
+NIXPACKS_PYTHON_VERSION = "3.11"
+
+[phases.setup]
+cmds = ["pip install --upgrade pip"]
+
+[start]
+cmd = "python bot.py"
