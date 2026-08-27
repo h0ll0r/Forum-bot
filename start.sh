@@ -1,6 +1,6 @@
 #!/bin/bash
-echo "Installing Playwright browsers..."
-playwright install chromium
-playwright install-deps chromium
+echo "Installing Playwright dependencies..."
+pip install playwright
+playwright install chromium --with-deps
 echo "Starting bot..."
 python bot.py
