@@ -40,9 +40,9 @@ class ForumMonitor:
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
         self.is_logged_in = False
+        self._2fa_page: Optional[Page] = None  # Сохранённая страница 2FA
 
     async def _init_browser(self):
-        """Инициализировать браузер"""
         if self.playwright is None:
             self.playwright = await async_playwright().start()
         if self.browser is None or not self.browser.is_connected():
@@ -52,66 +52,74 @@ class ForumMonitor:
             )
 
     async def _get_context(self) -> BrowserContext:
-        """Получить контекст браузера (с сохранённой сессией если есть)"""
         await self._init_browser()
         if self.context:
             return self.context
 
-        storage = {}
+        storage = None
         if os.path.exists(SESSION_FILE):
             with open(SESSION_FILE, "r") as f:
                 storage = json.load(f)
 
         self.context = await self.browser.new_context(
-            storage_state=storage if storage else None,
+            storage_state=storage,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
         return self.context
 
     async def _save_session(self):
-        """Сохранить сессию"""
         if self.context:
             storage = await self.context.storage_state()
             with open(SESSION_FILE, "w") as f:
                 json.dump(storage, f)
             logger.info("Сессия сохранена")
 
+    async def _wait_for_page(self, page: Page, selector: str = None):
+        """Ждём загрузки страницы и прохождения DDoS защиты"""
+        await page.wait_for_timeout(9000)
+        if selector:
+            await page.wait_for_selector(selector, timeout=15000)
+
     async def login(self, username: str, password: str) -> str:
-        """Вход на форум через браузер"""
+        """Вход на форум"""
         try:
             ctx = await self._get_context()
-            page = await ctx.new_page()
 
+            # Закрываем старую 2FA страницу если есть
+            if self._2fa_page and not self._2fa_page.is_closed():
+                await self._2fa_page.close()
+            self._2fa_page = None
+
+            page = await ctx.new_page()
             logger.info("Открываю страницу логина...")
             await page.goto("https://forum.majestic-rp.ru/login/", timeout=30000)
 
-            # Ждём пока DDoS защита пройдёт (~8 сек)
-            await page.wait_for_timeout(9000)
-            await page.wait_for_selector("input[name='login']", timeout=15000)
-            logger.info("Страница логина загружена")
+            # Ждём DDoS защиту
+            await self._wait_for_page(page, "input[name='login']")
+            logger.info("Страница логина загружена, ввожу данные")
 
             await page.fill("input[name='login']", username)
             await page.fill("input[name='password']", password)
 
-            # Чекбокс "запомнить"
             try:
                 await page.check("input[name='remember']")
             except:
                 pass
 
             await page.click("button[type='submit']")
-            await page.wait_for_load_state("networkidle", timeout=15000)
+            await page.wait_for_timeout(5000)
 
             url = page.url
+            content = await page.content()
             logger.info(f"После логина URL: {url}")
 
-            # Проверяем 2FA
-            if "two-step" in url or "two_step" in url:
-                await page.close()
+            # 2FA — сохраняем страницу открытой!
+            if "two-step" in url or "two_step" in url or "two_step" in content or "totp" in content:
+                self._2fa_page = page
+                logger.info("Требуется 2FA, страница сохранена")
                 return "2fa_required"
 
-            # Проверяем успех
-            content = await page.content()
+            # Успех
             if "logout" in content.lower() or "выйти" in content.lower():
                 await self._save_session()
                 self.is_logged_in = True
@@ -119,13 +127,8 @@ class ForumMonitor:
                 logger.info("Успешный вход!")
                 return "success"
 
-            # Может быть 2FA по содержимому
-            if "two_step" in content or "totp" in content:
-                await page.close()
-                return "2fa_required"
-
             await page.close()
-            logger.warning("Вход не удался")
+            logger.warning(f"Вход не удался. URL: {url}")
             return "failed"
 
         except Exception as e:
@@ -133,33 +136,44 @@ class ForumMonitor:
             return "failed"
 
     async def submit_2fa(self, totp_code: str) -> bool:
-        """Отправить 2FA код"""
+        """Отправить 2FA код используя сохранённую страницу"""
         try:
-            ctx = await self._get_context()
-            page = await ctx.new_page()
+            page = self._2fa_page
+            if not page or page.is_closed():
+                logger.error("2FA страница не найдена или закрыта, нужно войти заново")
+                return False
 
-            await page.goto("https://forum.majestic-rp.ru/login/two-step", wait_until="networkidle", timeout=20000)
+            logger.info(f"Ввожу 2FA код на странице: {page.url}")
 
-            # Вводим код
-            await page.fill("input[name='code']", totp_code)
+            # Очищаем и вводим код
+            code_input = await page.query_selector("input[name='code']")
+            if not code_input:
+                logger.error("Поле code не найдено на странице 2FA")
+                return False
 
-            # Чекбокс доверять устройству
+            await code_input.fill(totp_code)
+
             try:
                 await page.check("input[name='trust']")
             except:
                 pass
 
             await page.click("button[type='submit']")
-            await page.wait_for_load_state("networkidle", timeout=15000)
+            await page.wait_for_timeout(5000)
 
             content = await page.content()
+            url = page.url
+            logger.info(f"После 2FA URL: {url}")
+
             if "logout" in content.lower() or "выйти" in content.lower():
                 await self._save_session()
                 self.is_logged_in = True
+                self._2fa_page = None
                 await page.close()
+                logger.info("2FA прошла успешно!")
                 return True
 
-            await page.close()
+            logger.warning(f"2FA не прошла. URL: {url}")
             return False
 
         except Exception as e:
@@ -167,7 +181,6 @@ class ForumMonitor:
             return False
 
     async def check_session(self) -> bool:
-        """Проверить что сессия жива"""
         try:
             ctx = await self._get_context()
             page = await ctx.new_page()
@@ -180,7 +193,6 @@ class ForumMonitor:
             return False
 
     async def get_new_threads(self) -> List[Dict]:
-        """Получить список новых тем"""
         try:
             ctx = await self._get_context()
             page = await ctx.new_page()
@@ -221,7 +233,6 @@ class ForumMonitor:
             return []
 
     async def get_thread_content(self, url: str) -> Optional[Dict]:
-        """Получить содержимое темы"""
         try:
             ctx = await self._get_context()
             page = await ctx.new_page()
@@ -231,7 +242,6 @@ class ForumMonitor:
             await page.close()
 
             soup = BeautifulSoup(content, "html.parser")
-
             first_post = soup.select_one("article.message--post")
             if not first_post:
                 return None
@@ -246,7 +256,6 @@ class ForumMonitor:
                 if author_el:
                     replies.append(author_el.text.strip())
 
-            # XenForo thread ID
             xf_id_match = re.search(r'/threads/[^/]+-(\d+)/', url)
             if not xf_id_match:
                 xf_id_match = re.search(r'\.(\d+)/?', url)
@@ -262,27 +271,23 @@ class ForumMonitor:
             return None
 
     async def post_reply(self, url: str, message: str, xf_thread_id: str) -> bool:
-        """Ответить в теме"""
         try:
             ctx = await self._get_context()
             page = await ctx.new_page()
             await page.goto(url, timeout=20000)
             await page.wait_for_timeout(9000)
 
-            # Заполнить текстовое поле ответа
             await page.wait_for_selector(".js-editorHiddenVal, textarea[name='message']", timeout=10000)
 
             try:
-                # XenForo rich editor
                 editor = page.locator(".fr-element[contenteditable='true']")
                 await editor.click()
                 await editor.fill(message)
             except:
-                # Fallback: обычный textarea
                 await page.fill("textarea[name='message']", message)
 
             await page.click("button.button--primary[type='submit']")
-            await page.wait_for_load_state("networkidle", timeout=15000)
+            await page.wait_for_timeout(5000)
             await page.close()
             return True
         except Exception as e:
@@ -290,24 +295,19 @@ class ForumMonitor:
             return False
 
     async def close_thread(self, url: str, xf_thread_id: str) -> bool:
-        """Закрыть тему"""
         try:
             ctx = await self._get_context()
             page = await ctx.new_page()
-
-            # Открыть меню управления темой
             await page.goto(url, timeout=20000)
             await page.wait_for_timeout(9000)
 
-            # XenForo: кнопка закрытия темы для модераторов
             try:
                 await page.click("a[data-xf-click='overlay'][href*='toggle-open']", timeout=5000)
-                await page.wait_for_load_state("networkidle", timeout=10000)
+                await page.wait_for_timeout(3000)
             except:
-                # Альтернатив: через inline mod
                 try:
                     close_url = f"https://forum.majestic-rp.ru/threads/{xf_thread_id}/toggle-open"
-                    await page.goto(close_url, wait_until="networkidle", timeout=15000)
+                    await page.goto(close_url, timeout=15000)
                 except:
                     pass
 
@@ -318,7 +318,6 @@ class ForumMonitor:
             return False
 
     def validate_thread(self, content: str, title: str) -> Dict:
-        """Проверить жалобу по правилам"""
         errors = []
 
         required_fields = [
@@ -359,7 +358,6 @@ class ForumMonitor:
         return {"valid": len(errors) == 0, "errors": errors}
 
     async def process_thread(self, thread: Dict) -> str:
-        """Обработать одну тему"""
         url = thread["url"]
         thread_id = thread["id"]
         title = thread["title"]
@@ -415,13 +413,11 @@ class ForumMonitor:
             logger.error(f"Ошибка уведомления: {e}")
 
     async def start_monitoring(self):
-        """Основной цикл мониторинга"""
         logger.info("Мониторинг запущен")
         check_count = 0
         while True:
             if config.is_monitoring and self.is_logged_in:
                 try:
-                    # Проверяем сессию каждые 30 итераций
                     if check_count % 30 == 0:
                         session_ok = await self.check_session()
                         if not session_ok:
