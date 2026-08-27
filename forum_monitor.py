@@ -83,10 +83,12 @@ class ForumMonitor:
             page = await ctx.new_page()
 
             logger.info("Открываю страницу логина...")
-            await page.goto("https://forum.majestic-rp.ru/login/", wait_until="networkidle", timeout=30000)
+            await page.goto("https://forum.majestic-rp.ru/login/", timeout=30000)
 
-            # Ждём пока JS защита пройдёт
+            # Ждём пока DDoS защита пройдёт (~8 сек)
+            await page.wait_for_timeout(9000)
             await page.wait_for_selector("input[name='login']", timeout=15000)
+            logger.info("Страница логина загружена")
 
             await page.fill("input[name='login']", username)
             await page.fill("input[name='password']", password)
@@ -169,7 +171,8 @@ class ForumMonitor:
         try:
             ctx = await self._get_context()
             page = await ctx.new_page()
-            await page.goto("https://forum.majestic-rp.ru/", wait_until="networkidle", timeout=20000)
+            await page.goto("https://forum.majestic-rp.ru/", timeout=20000)
+            await page.wait_for_timeout(9000)
             content = await page.content()
             await page.close()
             return "logout" in content.lower() or "выйти" in content.lower()
@@ -181,7 +184,8 @@ class ForumMonitor:
         try:
             ctx = await self._get_context()
             page = await ctx.new_page()
-            await page.goto(config.FORUM_URL, wait_until="networkidle", timeout=20000)
+            await page.goto(config.FORUM_URL, timeout=20000)
+            await page.wait_for_timeout(9000)
             content = await page.content()
             await page.close()
 
@@ -221,7 +225,8 @@ class ForumMonitor:
         try:
             ctx = await self._get_context()
             page = await ctx.new_page()
-            await page.goto(url, wait_until="networkidle", timeout=20000)
+            await page.goto(url, timeout=20000)
+            await page.wait_for_timeout(9000)
             content = await page.content()
             await page.close()
 
@@ -261,7 +266,8 @@ class ForumMonitor:
         try:
             ctx = await self._get_context()
             page = await ctx.new_page()
-            await page.goto(url, wait_until="networkidle", timeout=20000)
+            await page.goto(url, timeout=20000)
+            await page.wait_for_timeout(9000)
 
             # Заполнить текстовое поле ответа
             await page.wait_for_selector(".js-editorHiddenVal, textarea[name='message']", timeout=10000)
@@ -290,7 +296,8 @@ class ForumMonitor:
             page = await ctx.new_page()
 
             # Открыть меню управления темой
-            await page.goto(url, wait_until="networkidle", timeout=20000)
+            await page.goto(url, timeout=20000)
+            await page.wait_for_timeout(9000)
 
             # XenForo: кнопка закрытия темы для модераторов
             try:
