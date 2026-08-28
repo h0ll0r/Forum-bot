@@ -98,8 +98,11 @@ class ForumMonitor:
             await self._wait_for_page(page, "input[name='login']")
             logger.info("Страница логина загружена, ввожу данные")
 
-            await page.fill("input[name='login']", username)
-            await page.fill("input[name='password']", password)
+            # Используем type вместо fill для корректной передачи спецсимволов
+            await page.click("input[name='login']")
+            await page.keyboard.type(username)
+            await page.click("input[name='password']")
+            await page.keyboard.type(password)
 
             try:
                 await page.check("input[name='remember']")
