@@ -161,8 +161,9 @@ class ForumMonitor:
             except:
                 pass
 
-            await page.click("button[type='submit']")
-            await page.wait_for_timeout(3000)
+            # Нажимаем первую кнопку Подтвердить (не Войти)
+            await page.locator("button[type='submit']").first.click()
+            await page.wait_for_timeout(5000)
 
             content = await page.content()
             url = page.url
