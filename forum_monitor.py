@@ -162,14 +162,19 @@ class ForumMonitor:
                 pass
 
             # Нажимаем первую кнопку Подтвердить (не Войти)
+            logger.info("Нажимаю кнопку Подтвердить...")
             await page.locator("button[type='submit']").first.click()
+            logger.info("Кнопка нажата, жду редирект...")
             await page.wait_for_timeout(5000)
+            logger.info(f"URL после клика: {page.url}")
 
-            content = await page.content()
+            # Ждём DDoS защиту на новой странице
+            await page.wait_for_timeout(9000)
+            logger.info(f"URL после ожидания: {page.url}")
+
             url = page.url
-            logger.info(f"После 2FA URL: {url}")
-
-            if "logout" in content.lower() or "выйти" in content.lower():
+            # Проверяем URL — если не two-step значит вошли
+            if "two-step" not in url and "two_step" not in url:
                 await self._save_session()
                 self.is_logged_in = True
                 self._2fa_page = None
