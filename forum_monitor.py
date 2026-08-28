@@ -111,27 +111,39 @@ class ForumMonitor:
             await self._wait_for_page(page, "input[name='login']")
             logger.info("Страница логина загружена, ввожу данные")
 
-            # Заполняем через JS — не зависит от viewport
-            await page.evaluate("""([login, password]) => {
-                let l = document.querySelector("input[name='login']");
-                let p = document.querySelector("input[name='password']");
-                if (l) { l.value = login; l.dispatchEvent(new Event('input', {bubbles:true})); }
-                if (p) { p.value = password; p.dispatchEvent(new Event('input', {bubbles:true})); }
-            }""", [username, password])
+            # Заполняем поля через Playwright fill() — корректно обрабатывает
+            # любые спецсимволы (апострофы, кавычки и т.д.) без JS-инъекций
+            login_input = page.locator("input[name='login']")
+            password_input = page.locator("input[name='password']")
 
-            # Чекбокс remember
+            await login_input.click()
+            await login_input.fill("")
+            await login_input.type(username, delay=50)
+
+            await password_input.click()
+            await password_input.fill("")
+            await password_input.type(password, delay=50)
+
+            # Чекбокс remember — через JS безопасно (нет спецсимволов)
             await page.evaluate("""() => {
                 let r = document.querySelector("input[name='remember']");
-                if (r) r.checked = true;
+                if (r) { r.checked = true; r.dispatchEvent(new Event('change', {bubbles:true})); }
             }""")
 
-            # Нажимаем кнопку через JS
+            # Отправляем форму через form.submit() — самый надёжный способ,
+            # не зависит от положения кнопки в viewport
             await page.evaluate("""() => {
-                let btn = document.querySelector(".button--primary[type='submit']");
-                if (!btn) btn = document.querySelector("button[type='submit']");
-                if (btn) btn.click();
+                let form = document.querySelector("form.login-form, form[action*='login']");
+                if (form) {
+                    form.submit();
+                } else {
+                    // fallback: ищем любую кнопку submit и кликаем через JS
+                    let btn = document.querySelector("button[type='submit']");
+                    if (btn) btn.click();
+                }
             }""")
-            await page.wait_for_timeout(5000)
+
+            await page.wait_for_timeout(6000)
 
             url = page.url
             content = await page.content()
@@ -169,23 +181,37 @@ class ForumMonitor:
 
             logger.info(f"Ввожу 2FA код на странице: {page.url}")
 
-            # Очищаем и вводим код
-            code_input = await page.query_selector("input[name='code']")
-            if not code_input:
+            # Вводим код — fill() безопасен для цифровых кодов
+            code_input = page.locator("input[name='code']")
+            if await code_input.count() == 0:
                 logger.error("Поле code не найдено на странице 2FA")
                 return False
 
-            await code_input.fill(totp_code)
+            await code_input.fill("")
+            await code_input.type(totp_code, delay=30)
 
+            # Чекбокс "доверять устройству"
             try:
-                await page.check("input[name='trust']")
+                await page.evaluate("""() => {
+                    let t = document.querySelector("input[name='trust']");
+                    if (t) { t.checked = true; t.dispatchEvent(new Event('change', {bubbles:true})); }
+                }""")
             except:
                 pass
 
-            # Нажимаем первую кнопку Подтвердить (не Войти)
-            logger.info("Нажимаю кнопку Подтвердить...")
-            await page.locator("button[type='submit']").first.click()
-            logger.info("Кнопка нажата, жду редирект...")
+            # Нажимаем через JS form.submit() — полностью обходит проблему viewport
+            logger.info("Отправляю форму 2FA через JS...")
+            await page.evaluate("""() => {
+                let form = document.querySelector("form");
+                if (form) {
+                    form.submit();
+                } else {
+                    let btn = document.querySelector("button[type='submit']");
+                    if (btn) btn.click();
+                }
+            }""")
+
+            logger.info("Форма отправлена, жду редирект...")
             await page.wait_for_timeout(5000)
             logger.info(f"URL после клика: {page.url}")
 
@@ -194,8 +220,13 @@ class ForumMonitor:
             logger.info(f"URL после ожидания: {page.url}")
 
             url = page.url
-            # Проверяем URL — если не two-step значит вошли
-            if "two-step" not in url and "two_step" not in url:
+            content = await page.content()
+
+            # Проверяем и URL, и контент — оба варианта успеха
+            url_ok = "two-step" not in url and "two_step" not in url
+            content_ok = "logout" in content.lower() or "выйти" in content.lower()
+
+            if url_ok or content_ok:
                 await self._save_session()
                 self.is_logged_in = True
                 self._2fa_page = None
