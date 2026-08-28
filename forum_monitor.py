@@ -159,7 +159,7 @@ class ForumMonitor:
                 pass
 
             await page.click("button[type='submit']")
-            await page.wait_for_timeout(5000)
+            await page.wait_for_timeout(3000)
 
             content = await page.content()
             url = page.url

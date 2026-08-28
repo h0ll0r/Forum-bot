@@ -182,13 +182,13 @@ def register_handlers(dp: Dispatcher, monitor: ForumMonitor):
         if not config.is_allowed(message.from_user.id):
             return
         code = message.text.strip()
-        msg = await message.answer("⏳ Проверяю код...")
+        # Сразу вводим код — не ждём, TOTP истекает за 30 сек!
         result = await monitor.submit_2fa(code)
         if result:
             await state.clear()
-            await msg.edit_text("✅ Авторизация успешна! Мониторинг можно запускать.")
+            await message.answer("✅ Авторизация успешна! Мониторинг можно запускать.")
         else:
-            await msg.edit_text("❌ Неверный код. Попробуй ещё раз:")
+            await message.answer("❌ Неверный код. Вводи код сразу как он появился в приложении:")
 
     # ─── Шаблон ответа ─────────────────────────────────────────────
     @dp.callback_query(F.data == "set_template")
