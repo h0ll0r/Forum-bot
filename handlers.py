@@ -1,12 +1,16 @@
 import logging
+import time
+import psutil
+import urllib.request
+from datetime import datetime
 from aiogram import Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from config import config
-from forum_monitor import ForumMonitor
+from forum_monitor import ForumMonitor, STATS
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +37,7 @@ def main_keyboard():
         ],
         [
             InlineKeyboardButton(text="📣 Статус в канал", callback_data="send_status"),
+            InlineKeyboardButton(text="📊 Стат в канал", callback_data="send_stats"),
         ],
         [
             InlineKeyboardButton(text="🔑 Авторизация форума", callback_data="login"),
@@ -45,12 +50,6 @@ def settings_keyboard():
         [InlineKeyboardButton(text="⏱ Интервал проверки", callback_data="set_interval")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back_main")],
     ])
-
-# ─── Middleware: проверка доступа ─────────────────────────────────
-async def check_access(message: types.Message) -> bool:
-    if not config.is_allowed(message.from_user.id):
-        return False  # молча игнорируем
-    return True
 
 # ─── Регистрация хендлеров ────────────────────────────────────────
 def register_handlers(dp: Dispatcher, monitor: ForumMonitor, send_status_fn=None):
@@ -77,12 +76,9 @@ def register_handlers(dp: Dispatcher, monitor: ForumMonitor, send_status_fn=None
     async def back_main(callback: types.CallbackQuery):
         if not config.is_allowed(callback.from_user.id):
             return
-        await callback.message.edit_text(
-            "🏠 Главное меню",
-            reply_markup=main_keyboard()
-        )
+        await callback.message.edit_text("🏠 Главное меню", reply_markup=main_keyboard())
 
-    # Callback: статистика
+    # Callback: статистика (в боте)
     @dp.callback_query(F.data == "stats")
     async def show_stats(callback: types.CallbackQuery):
         if not config.is_allowed(callback.from_user.id):
@@ -90,10 +86,10 @@ def register_handlers(dp: Dispatcher, monitor: ForumMonitor, send_status_fn=None
         reasons = "\n".join([f"  • {k[:40]}: {v}" for k, v in list(STATS["reject_reasons"].items())[:5]])
         text = (
             f"📊 *Статистика*\n\n"
-            f"Проверено тем: {STATS['total_checked']}\n"
+            f"🔍 Проверено тем: {STATS['total_checked']}\n"
             f"✅ Принято: {STATS['accepted']}\n"
             f"❌ Отклонено: {STATS['rejected']}\n"
-            f"⏭ Пропущено (взяты другими): {STATS['skipped_taken']}\n"
+            f"⏭ Пропущено: {STATS['skipped_taken']}\n"
         )
         if reasons:
             text += f"\n*Причины отклонений:*\n{reasons}"
@@ -157,22 +153,15 @@ def register_handlers(dp: Dispatcher, monitor: ForumMonitor, send_status_fn=None
             return
         await state.update_data(password=message.text)
         data = await state.get_data()
-
-        # Удалить сообщения с паролем для безопасности
         try:
             await message.delete()
         except:
             pass
-
         msg = await message.answer("⏳ Выполняю вход...")
         result = await monitor.login(data["login"], data["password"])
-
         if result == "2fa_required":
             await state.set_state(LoginStates.waiting_2fa)
-            await msg.edit_text(
-                "📱 Требуется код из Google Authenticator.\n"
-                "Введи 6-значный код:"
-            )
+            await msg.edit_text("📱 Требуется код из Google Authenticator.\nВведи 6-значный код:")
         elif result == "success":
             await state.clear()
             await msg.edit_text("✅ Авторизация успешна! Мониторинг можно запускать.")
@@ -184,9 +173,7 @@ def register_handlers(dp: Dispatcher, monitor: ForumMonitor, send_status_fn=None
     async def get_2fa(message: types.Message, state: FSMContext):
         if not config.is_allowed(message.from_user.id):
             return
-        code = message.text.strip()
-        # Сразу вводим код — не ждём, TOTP истекает за 30 сек!
-        result = await monitor.submit_2fa(code)
+        result = await monitor.submit_2fa(message.text.strip())
         if result:
             await state.clear()
             await message.answer("✅ Авторизация успешна! Мониторинг можно запускать.")
@@ -246,7 +233,7 @@ def register_handlers(dp: Dispatcher, monitor: ForumMonitor, send_status_fn=None
         except ValueError:
             await message.answer("❌ Введи число (например: 120)")
 
-    # Кнопка статус в канал
+    # ─── Статус в канал ────────────────────────────────────────────
     @dp.callback_query(F.data == "send_status")
     async def send_status(callback: types.CallbackQuery):
         if not config.is_allowed(callback.from_user.id):
@@ -256,6 +243,60 @@ def register_handlers(dp: Dispatcher, monitor: ForumMonitor, send_status_fn=None
             await callback.answer("✅ Статус отправлен в канал!")
         else:
             await callback.answer("❌ Функция статуса недоступна")
+
+    # ─── Статистика в канал ────────────────────────────────────────
+    @dp.callback_query(F.data == "send_stats")
+    async def send_stats_to_channel(callback: types.CallbackQuery):
+        if not config.is_allowed(callback.from_user.id):
+            return
+        if not config.CHANNEL_ID:
+            await callback.answer("❌ CHANNEL_ID не настроен!", show_alert=True)
+            return
+        try:
+            now = datetime.now()
+
+            # Аптайм
+            try:
+                from bot import START_TIME
+                uptime = now - START_TIME
+                h, m = uptime.seconds // 3600, (uptime.seconds % 3600) // 60
+                uptime_str = f"{h}ч {m}м"
+            except:
+                uptime_str = "—"
+
+            # Пинг до форума
+            try:
+                t0 = time.monotonic()
+                urllib.request.urlopen("https://forum.majestic-rp.ru", timeout=5)
+                ping_str = f"{int((time.monotonic() - t0) * 1000)} мс"
+            except:
+                ping_str = "недоступен"
+
+            # Система
+            mem = psutil.virtual_memory()
+            cpu = psutil.cpu_percent(interval=0.5)
+            status = "🟢 Активен" if config.is_monitoring else "🔴 Пауза"
+
+            text = (
+                f"🤖 *Majestic RP · Статус бота*\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📡 Мониторинг: {status}\n"
+                f"⏳ Аптайм: `{uptime_str}`\n"
+                f"🏓 Пинг до форума: `{ping_str}`\n"
+                f"🖥 CPU `{cpu}%`  ·  💾 RAM `{mem.percent}%`\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📊 *Статистика жалоб*\n"
+                f"✅ Принято: *{STATS['accepted']}*\n"
+                f"❌ Отклонено: *{STATS['rejected']}*\n"
+                f"⏭ Пропущено: *{STATS['skipped_taken']}*\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🕐 `{now.strftime('%d.%m.%Y %H:%M:%S')}`"
+            )
+            await callback.bot.send_message(config.CHANNEL_ID, text, parse_mode="Markdown")
+            await callback.answer("✅ Отправлено в канал!")
+        except Exception as e:
+            logger.error(f"Ошибка отправки статистики: {e}")
+            await callback.answer("❌ Ошибка отправки", show_alert=True)
 
     # /cancel глобальный
     @dp.message(Command("cancel"))
