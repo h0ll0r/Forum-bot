@@ -32,8 +32,15 @@ STATS = {
     "reject_reasons": {}
 }
 
+# Алиас для доступа снаружи
+def get_stats():
+    return STATS
+
 
 class ForumMonitor:
+    @property
+    def STATS(self):
+        return STATS
     def __init__(self, bot):
         self.bot = bot
         self.playwright = None

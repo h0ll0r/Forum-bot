@@ -6,7 +6,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 
 from config import config
-from forum_monitor import ForumMonitor, STATS
+from forum_monitor import ForumMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,9 @@ def main_keyboard():
             InlineKeyboardButton(text="⏸ Пауза", callback_data="monitor_off"),
         ],
         [
+            InlineKeyboardButton(text="📣 Статус в канал", callback_data="send_status"),
+        ],
+        [
             InlineKeyboardButton(text="🔑 Авторизация форума", callback_data="login"),
         ],
     ])
@@ -50,7 +53,7 @@ async def check_access(message: types.Message) -> bool:
     return True
 
 # ─── Регистрация хендлеров ────────────────────────────────────────
-def register_handlers(dp: Dispatcher, monitor: ForumMonitor):
+def register_handlers(dp: Dispatcher, monitor: ForumMonitor, send_status_fn=None):
 
     # /start
     @dp.message(Command("start"))
@@ -242,6 +245,17 @@ def register_handlers(dp: Dispatcher, monitor: ForumMonitor):
             await message.answer(f"✅ Интервал установлен: {val} сек.", reply_markup=main_keyboard())
         except ValueError:
             await message.answer("❌ Введи число (например: 120)")
+
+    # Кнопка статус в канал
+    @dp.callback_query(F.data == "send_status")
+    async def send_status(callback: types.CallbackQuery):
+        if not config.is_allowed(callback.from_user.id):
+            return
+        if send_status_fn:
+            await send_status_fn()
+            await callback.answer("✅ Статус отправлен в канал!")
+        else:
+            await callback.answer("❌ Функция статуса недоступна")
 
     # /cancel глобальный
     @dp.message(Command("cancel"))
