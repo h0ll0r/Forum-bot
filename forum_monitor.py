@@ -55,7 +55,12 @@ class ForumMonitor:
         if self.browser is None or not self.browser.is_connected():
             self.browser = await self.playwright.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--window-size=1920,1080",
+                ]
             )
 
     async def _get_context(self) -> BrowserContext:
@@ -70,7 +75,8 @@ class ForumMonitor:
 
         self.context = await self.browser.new_context(
             storage_state=storage,
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1920, "height": 1080}
         )
         return self.context
 
@@ -105,18 +111,26 @@ class ForumMonitor:
             await self._wait_for_page(page, "input[name='login']")
             logger.info("Страница логина загружена, ввожу данные")
 
-            # Используем type вместо fill для корректной передачи спецсимволов
-            await page.click("input[name='login']")
-            await page.keyboard.type(username)
-            await page.click("input[name='password']")
-            await page.keyboard.type(password)
+            # Заполняем через JS — не зависит от viewport
+            await page.evaluate("""([login, password]) => {
+                let l = document.querySelector("input[name='login']");
+                let p = document.querySelector("input[name='password']");
+                if (l) { l.value = login; l.dispatchEvent(new Event('input', {bubbles:true})); }
+                if (p) { p.value = password; p.dispatchEvent(new Event('input', {bubbles:true})); }
+            }""", [username, password])
 
-            try:
-                await page.check("input[name='remember']")
-            except:
-                pass
+            # Чекбокс remember
+            await page.evaluate("""() => {
+                let r = document.querySelector("input[name='remember']");
+                if (r) r.checked = true;
+            }""")
 
-            await page.click("button[type='submit']")
+            # Нажимаем кнопку через JS
+            await page.evaluate("""() => {
+                let btn = document.querySelector(".button--primary[type='submit']");
+                if (!btn) btn = document.querySelector("button[type='submit']");
+                if (btn) btn.click();
+            }""")
             await page.wait_for_timeout(5000)
 
             url = page.url
